@@ -2,8 +2,9 @@
 
 Reusable, dependency-free Python library for fitting **Plackett–Luce abilities
 from partial top-k, tie-free rankings** with optional per-observation
-participant sets, a sum-to-zero constraint, and an L2 penalty. Standard library
-only.
+participant sets, a sum-to-zero constraint, and an L2 penalty, plus **exact
+likelihoods of precedence constraints (partial orders) over a fixed candidate
+set** by summation over all legal linear extensions. Standard library only.
 
 ## Requirements
 
@@ -14,7 +15,7 @@ only.
 ## Commands
 
 ```bash
-python -m unittest discover -s tests -v   # full test suite (35 tests)
+python -m unittest discover -s tests -v   # full test suite (62 tests)
 python demo.py                            # deterministic live demo (~0.1 s)
 ```
 
@@ -51,15 +52,51 @@ on the free `n-1` coordinates, so a **unique minimizer always exists**; there
 is no infeasibility regime to report for valid data (separation cannot diverge
 the estimate because of the penalty).
 
+### Precedence constraints over a fixed candidate set (exact)
+
+Given a fixed candidate set `A` with `1 ≤ |A| ≤ 6` and strict precedence pairs
+`(before, after)` ("`before` must rank ahead of `after`"):
+
+1. The pairs are interpreted as a directed graph and **checked to be acyclic
+   first** (Kahn's algorithm). A self-loop or any cycle is a contradiction and
+   raises `PLInputError` before enumeration.
+2. The likelihood is the **exact sum over every legal linear extension** (a
+   full permutation of `A` satisfying all pairs) of the staged ranking
+   probability defined above:
+
+```
+P(constraints | theta, A) = Σ_{π ∈ LE(A, ≺)} Π_{j=1..|A|}
+                              exp(theta_{π_j}) / Σ_{i ∈ A \\ {π_1,…,π_{j-1}}} exp(theta_i)
+```
+
+- **Incomparable objects are never treated as tied**: each linear extension is
+  a distinct permutation and contributes its own probability.
+- Objects outside the candidate set behave exactly like non-participants in the
+  ranking model — they never enter any denominator.
+- Empty constraints admit all `|A|!` extensions, whose probabilities partition
+  the event space, so the likelihood is exactly `1`.
+- A total order (chain) has exactly one extension and equals the probability of
+  that one full ranking.
+- The sum is accumulated with logsumexp, and both the stable log likelihood,
+  the probability, the **number of legal extensions**, the materialized
+  candidate set, and the deduplicated constraint pairs are returned.
+- Enumeration is deterministic smallest-available-first topological
+  backtracking; the 6-candidate bound caps the work at `6! = 720` full
+  rankings, which is why the capability is exact rather than approximate.
+
 ## Public interface (`plackett_luce` package)
 
 | Name | Purpose |
 |---|---|
 | `MAX_OBJECTS = 20` | Hard interface bound on `n_objects`. |
+| `MAX_CANDIDATES = 6` | Hard bound on the candidate-set size for exact poset likelihood. |
 | `Observation(ranking=(), participants=None)` | One sample. `ranking`: distinct `int` indices, best first, length `k ≤ n`. `participants`: distinct indices, or `None` for all `n` objects. |
+| `OrderingConstraint(before, after)` | One strict precedence pair (frozen dataclass). |
+| `ConstrainedLikelihood` | `probability, log_probability, n_extensions, candidate_set, constraints`. |
 | `fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None, max_iter=100, gtol=1e-10)` | Penalized MLE by backtracking Newton. |
 | `ranking_log_probability(ranking, theta, participants=None)` | Stable log probability of one partial ranking. |
 | `ranking_probability(...)` | `exp` of the above (may underflow for tiny probabilities). |
+| `constrained_ranking_probability(constraints, theta, candidate_set=None)` | Acyclicity check then exact sum over all legal linear extensions. |
 | `penalized_objective(observations, theta, lam)` | Scalar objective at a sum-zero point. |
 | `penalized_gradient_free(...)` | Analytic gradient in the `n-1` free coordinates. |
 | `penalized_hessian_free(...)` | Analytic Hessian in the free coordinates. |
@@ -137,6 +174,22 @@ a rejected call cannot leave a partial change.
 - `observations` may be any finite iterable (lists, tuples, generators); each
   element must be an `Observation`.
 
+Precedence-constraint inputs follow the same rules and are all validated
+(candidates, endpoint indices, types, acyclicity) **before any linear
+extension is generated**, so a rejected call enumerates nothing and leaves no
+partial state (the API is purely functional):
+
+- `constraints` may be any finite iterable of `OrderingConstraint`; a bare
+  tuple `(0, 1)` is not accepted in place of one.
+- `candidate_set` must be distinct `int` indices, non-empty, and of size at
+  most `MAX_CANDIDATES` (6); `None` means all `n` objects (which then requires
+  `n ≤ 6` for this function). Both endpoints of every constraint must belong
+  to the candidate set. `bool`/float/string endpoints are rejected.
+- A self-loop or any directed cycle raises `PLInputError` whose message names
+  the objects still on the cycle. Duplicate or transitively redundant pairs
+  are accepted harmlessly and materialized once.
+- The shared `theta` rules apply unchanged (finite, length `n`, sum zero).
+
 ## Accuracy and error accounting
 
 All reported tolerances are on absolute or scaled quantities; tests do not use
@@ -151,6 +204,7 @@ loose tolerances to mask boundary errors.
 | Fitted vs. true abilities (600 deterministic samples) | Statistical recovery check, gauge-aligned | spread `≤ 0.25` |
 | Sum-to-zero of fitted theta | Direct | `≤ 1e-12` absolute |
 | `Σ contributions = log_likelihood` | `math.fsum` | `1e-10` absolute |
+| Poset likelihood & extension count (n ≤ 6) | Independent `itertools.permutations` brute force filtered by the pairs, scored by `tests/reference.py`; hand cases: `P(0≻1)=σ(θ₀−θ₁)` (with `θ=(a,−a)` this is `σ(2a)`), counts `n!`, `4!/(2!2!)`, uniform `P = #ext/n!` | `1e-12` absolute; counts exact |
 
 Expected values in tests come from closed-form expressions, bisection,
 explicit fraction products, or finite differences of the **independent**
@@ -174,19 +228,33 @@ near the optimum on the tested cases.
   favors accuracy and overflow safety over micro-optimization.
 - **Participant sets per observation** rather than a global eligibility mask,
   since disjoint/irregular event lineups are the target use case.
+- **Exact linear-extension enumeration for precedence likelihood.** With at
+  most 6 candidates (`≤ 720` orders) deterministic topological backtracking is
+  trivially fast and gives the exact probability and extension count, so no
+  sampling/approximation error budget is needed; larger sets are rejected at
+  the documented interface bound rather than silently approximated.
+- The poset path **reuses the existing staged ranking probability**
+  (`_staged_log_probability`), so the new capability sums the same
+  already-tested per-ranking likelihood instead of carrying a second formula.
 
 ## Known limitations
 
 - Implements exactly the contracted subset: tie-free top-k Plackett–Luce,
-  one global L2 penalty, sum-to-zero gauge. No ties/partial orders with
-  equivalence classes, no object-specific or grouped penalties, no
-  hierarchical/covariate (Bradley–Terry–Luce with features) models, no
+  one global L2 penalty, sum-to-zero gauge, and exact poset likelihoods over
+  candidate sets of at most 6. No ties/partial orders with equivalence
+  classes, no tie probability model, no object-specific or grouped penalties,
+  no hierarchical/covariate (Bradley–Terry–Luce with features) models, no
   Bayesian posterior or standard-error output, no claim of standards
   compliance beyond this contract.
-- `ranking_probability` exponentiates a log probability and can underflow to
-  `0.0`; use `ranking_log_probability` for very small probabilities.
-- Inputs must be materializable in memory; the observation iterable is
-  validated before fitting (generators are consumed once).
+- Precedence likelihood is **exact exhaustive enumeration** and is bounded to
+  6 candidates (`≤ 720` extensions); there is intentionally no
+  large-scale approximation, sampling estimator, or dynamic-programming path
+  for bigger candidate sets — oversize sets are rejected, not approximated.
+- `ranking_probability` and `ConstrainedLikelihood.probability` exponentiate
+  log values and can underflow to `0.0`; use the log forms for very small
+  probabilities.
+- Inputs must be materializable in memory; the observation/constraint
+  iterables are validated before computation (generators are consumed once).
 - Extremely large fitted `|theta|` (hundreds) are representable but not
   stress-tested; the L2 penalty keeps ordinary datasets far from that regime.
 
@@ -194,9 +262,11 @@ near the optimum on the tested cases.
 
 ```
 plackett_luce/__init__.py     # public API re-exports
-plackett_luce/model.py        # validation, likelihood, Newton solver
+plackett_luce/model.py        # validation, likelihood, Newton solver,
+                              #   acyclicity check + linear-extension sum
 tests/reference.py            # INDEPENDENT reference (no core import)
 tests/test_validation.py      # contract / error-semantics tests
 tests/test_math.py            # analytic extremum, FD derivatives, fit quality
+tests/test_constraints.py     # poset likelihood: hand cases, brute force, errors
 demo.py                       # deterministic synthetic-data demonstration
 ```

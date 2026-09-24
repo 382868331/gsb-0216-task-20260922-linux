@@ -12,6 +12,10 @@ Public API:
     penalized_objective           -- f(theta) = -loglik + lambda/2 ||theta||^2
     penalized_gradient_free       -- analytic gradient in n-1 free coordinates
     penalized_hessian_free        -- analytic Hessian in n-1 free coordinates
+    OrderingConstraint            -- "before must rank ahead of after" pair
+    ConstrainedLikelihood         -- poset likelihood: P, log P, extension count
+    MAX_CANDIDATES                -- candidate-set bound for poset likelihood (6)
+    constrained_ranking_probability -- sum ranking P over all linear extensions
 
 Model (see README.md for the full derivation):
     For a ranking (r_1, ..., r_k) over participant set A,
@@ -19,6 +23,15 @@ Model (see README.md for the full derivation):
                           sum_{i in A \\ {r_1..r_{j-1}}} exp(theta_i)
     Unranked participants stay in every remaining denominator; objects not in A
     never enter any denominator. k = 0 contributes log P = 0.
+
+Precedence constraints:
+    Given a fixed candidate set A (|A| <= 6) and strict precedence pairs
+    (before, after), the constraints are first checked to form an acyclic
+    poset; the likelihood is the exact sum of the staged ranking probability
+    above over every linear extension (full permutation of A satisfying the
+    poset). Incomparable objects are never treated as tied: each extension is
+    a separate permutation. A cyclic (contradictory) constraint set raises
+    PLInputError before any enumeration.
 """
 from __future__ import annotations
 
@@ -29,19 +42,27 @@ from typing import Sequence, Optional
 
 __all__ = [
     "MAX_OBJECTS",
+    "MAX_CANDIDATES",
     "ConvergenceStatus",
     "PLInputError",
     "Observation",
     "PLResult",
+    "OrderingConstraint",
+    "ConstrainedLikelihood",
     "fit_plackett_luce",
     "ranking_log_probability",
     "ranking_probability",
+    "constrained_ranking_probability",
     "penalized_objective",
     "penalized_gradient_free",
     "penalized_hessian_free",
 ]
 
 MAX_OBJECTS = 20
+
+# Hard bound on the candidate set for the exact linear-extension enumeration.
+# 6! = 720 full permutations at most, so exhaustive exact summation is cheap.
+MAX_CANDIDATES = 6
 
 # Sum-to-zero tolerance for user-supplied initial theta: relative, documented
 # in README. Violations are rejected; the constraint is never silently imposed.
@@ -103,6 +124,39 @@ class PLResult:
     log_contributions: tuple[float, ...]
     gradient_norm: float
     message: str
+
+
+@dataclass(frozen=True)
+class OrderingConstraint:
+    """One strict precedence pair: ``before`` must rank ahead of ``after``.
+
+    Both fields are int object indices in [0, n_objects). The pair must not
+    name the same object twice (a self-loop is a contradiction). A batch of
+    constraints is accepted only if its directed graph is acyclic; a cycle
+    (including a self-loop) raises PLInputError before any enumeration.
+    """
+
+    before: int
+    after: int
+
+
+@dataclass(frozen=True)
+class ConstrainedLikelihood:
+    """Exact likelihood of a poset over a fixed candidate set.
+
+    probability:       sum of the full-ranking Plackett-Luce probabilities of
+                       every legal linear extension (may underflow to 0.0).
+    log_probability:   stable ``log`` of that sum (logsumexp over extensions).
+    n_extensions:      number of legal linear extensions (>= 1 when acyclic).
+    candidate_set:     the materialized sorted tuple of candidates used.
+    constraints:       the materialized distinct (before, after) pairs used.
+    """
+
+    probability: float
+    log_probability: float
+    n_extensions: int
+    candidate_set: tuple[int, ...]
+    constraints: tuple[tuple[int, int], ...]
 
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +285,23 @@ def _validate_theta(theta, n: int, where: str = "theta") -> list[float]:
 # --------------------------------------------------------------------------- #
 # Core likelihood accumulation (stable logsumexp, analytic gradient & Hessian)
 # --------------------------------------------------------------------------- #
+def _staged_log_probability(rank, part, theta):
+    """Log probability of one full/partial ranking over participant set part.
+
+    Pure staged logsumexp, shared by the public ranking function and the exact
+    linear-extension summation (so the new capability reuses the existing,
+    already-tested ranking probability rather than re-deriving it).
+    """
+    remaining = list(part)
+    lp = 0.0
+    for winner in rank:
+        m = max(theta[i] for i in remaining)
+        s = math.fsum(math.exp(theta[i] - m) for i in remaining)
+        lp += theta[winner] - (m + math.log(s))
+        remaining.remove(winner)
+    return lp
+
+
 def _fill(normalized, theta, lam, want_derivs):
     """Return (objective, log_likelihood, per-obs log contributions, g, H).
 
@@ -381,19 +452,166 @@ def ranking_log_probability(ranking, theta, participants=None):
     n = len(theta)
     norm = _normalize([Observation(ranking, participants)], n)
     rank, part = norm[0]
-    remaining = list(part)
-    lp = 0.0
-    for winner in rank:
-        m = max(theta[i] for i in remaining)
-        s = math.fsum(math.exp(theta[i] - m) for i in remaining)
-        lp += theta[winner] - (m + math.log(s))
-        remaining.remove(winner)
-    return lp
+    return _staged_log_probability(rank, part, theta)
 
 
 def ranking_probability(ranking, theta, participants=None):
     """Probability of one partial ranking (may underflow for extremely small P)."""
     return math.exp(ranking_log_probability(ranking, theta, participants))
+
+
+# --------------------------------------------------------------------------- #
+# Precedence constraints over a fixed candidate set (exact, |A| <= 6)
+# --------------------------------------------------------------------------- #
+def _normalize_constraint_set(constraints, candidates, n):
+    """Validate candidates + precedence pairs up front.
+
+    Returns (candidate_tuple, distinct edge tuple, adjacency, indegree).
+    Nothing is enumerated before the whole input (including acyclicity) has
+    been accepted, so a rejected call leaves no partial state.
+    """
+    if candidates is None:
+        cand = tuple(range(n))
+    else:
+        cand = _checked_index_seq(candidates, "candidate_set", n)
+        if len(set(cand)) != len(cand):
+            dup = sorted({i for i in cand if cand.count(i) > 1})
+            raise PLInputError(
+                f"candidate_set: duplicated candidate index/indices {dup}")
+    if len(cand) == 0:
+        raise PLInputError("candidate_set: at least one candidate is required")
+    if len(cand) > MAX_CANDIDATES:
+        raise PLInputError(
+            f"candidate_set: size {len(cand)} exceeds the exact-enumeration "
+            f"bound of {MAX_CANDIDATES} candidates")
+
+    if isinstance(constraints, (str, bytes)) or not hasattr(constraints, "__iter__"):
+        raise PLInputError("constraints: expected an iterable of OrderingConstraint")
+
+    in_set = set(cand)
+    edges = set()
+    for t, con in enumerate(constraints):
+        where = f"constraints[{t}]"
+        if not isinstance(con, OrderingConstraint):
+            raise PLInputError(
+                f"{where}: expected OrderingConstraint, got {type(con).__name__}")
+        b = _checked_int(con.before, f"{where}.before", minimum=0, maximum=n - 1)
+        a = _checked_int(con.after, f"{where}.after", minimum=0, maximum=n - 1)
+        if b not in in_set:
+            raise PLInputError(
+                f"{where}: 'before' object {b} is not in the candidate set")
+        if a not in in_set:
+            raise PLInputError(
+                f"{where}: 'after' object {a} is not in the candidate set")
+        edges.add((b, a))
+
+    adjacency = {i: set() for i in cand}
+    indegree = {i: 0 for i in cand}
+    for b, a in edges:
+        if a not in adjacency[b]:
+            adjacency[b].add(a)
+            indegree[a] += 1
+    return cand, tuple(sorted(edges)), adjacency, indegree
+
+
+def _assert_acyclic(cand, adjacency, indegree):
+    """Kahn's algorithm; raise PLInputError naming a cycle if one exists.
+
+    Self-loops ((x, x)) are cycles too and are rejected here.
+    """
+    remaining_indegree = dict(indegree)
+    ready = sorted(i for i in cand if remaining_indegree[i] == 0)
+    seen = 0
+    while ready:
+        node = ready.pop()
+        seen += 1
+        for nxt in sorted(adjacency[node]):
+            remaining_indegree[nxt] -= 1
+            if remaining_indegree[nxt] == 0:
+                ready.append(nxt)
+    if seen != len(cand):
+        cycle_nodes = sorted(
+            i for i in cand if remaining_indegree[i] > 0)
+        raise PLInputError(
+            "constraints: precedence graph contains a cycle among objects "
+            f"{cycle_nodes}; contradictory (cyclic) orderings have no legal "
+            "linear extension")
+
+
+def _linear_extensions(cand, adjacency, indegree):
+    """Yield every topological ordering (linear extension) as a tuple.
+
+    Deterministic, smallest-available-first backtracking. At most 6! = 720
+    permutations are produced because the candidate set is bounded by
+    MAX_CANDIDATES.
+    """
+    order = []
+    chosen = set()
+    current = dict(indegree)
+
+    def extend():
+        if len(order) == len(cand):
+            yield tuple(order)
+            return
+        for node in cand:
+            if node not in chosen and current[node] == 0:
+                for nxt in adjacency[node]:
+                    current[nxt] -= 1
+                chosen.add(node)
+                order.append(node)
+                yield from extend()
+                order.pop()
+                chosen.remove(node)
+                for nxt in adjacency[node]:
+                    current[nxt] += 1
+
+    yield from extend()
+
+
+def constrained_ranking_probability(constraints, theta, candidate_set=None):
+    """Exact likelihood of precedence constraints over a fixed candidate set.
+
+    The constraints are strict "before ranks ahead of after" pairs. They are
+    first checked to form an acyclic partial order; the likelihood is then the
+    exact sum of the full Plackett-Luce ranking probability over every legal
+    linear extension of the candidates (incomparable objects are enumerated as
+    distinct orders, never treated as tied).
+
+    Arguments:
+        constraints:   iterable of OrderingConstraint (validated as one batch).
+        theta:         finite length-n abilities with sum(theta) = 0.
+        candidate_set: distinct int indices, or None for all n objects. The
+            set must contain 1..MAX_CANDIDATES (6) elements; every constraint
+            endpoint must belong to it. Candidates outside the set are exactly
+            like non-participants: they never enter any denominator.
+
+    Returns ConstrainedLikelihood (probability, log_probability, n_extensions,
+    candidate_set, constraints). A cyclic/contradictory constraint set, an
+    out-of-range or oversized candidate set, or invalid theta raises
+    PLInputError before any enumeration.
+    """
+    theta = _validate_theta_arg(theta)
+    n = len(theta)
+    cand, edges, adjacency, indegree = _normalize_constraint_set(
+        constraints, candidate_set, n)
+    _assert_acyclic(cand, adjacency, indegree)
+
+    log_terms = []
+    n_extensions = 0
+    for perm in _linear_extensions(cand, adjacency, indegree):
+        log_terms.append(_staged_log_probability(perm, cand, theta))
+        n_extensions += 1
+
+    # Sum probabilities exactly via logsumexp over the (at most 720) terms.
+    m = max(log_terms)
+    log_probability = m + math.log(math.fsum(math.exp(v - m) for v in log_terms))
+    return ConstrainedLikelihood(
+        probability=math.exp(log_probability),
+        log_probability=log_probability,
+        n_extensions=n_extensions,
+        candidate_set=cand,
+        constraints=edges,
+    )
 
 
 def fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None,
