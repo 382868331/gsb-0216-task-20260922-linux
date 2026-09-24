@@ -2,8 +2,10 @@
 
 Reusable, dependency-free Python library for fitting **Plackett–Luce abilities
 from partial top-k, tie-free rankings** with optional per-observation
-participant sets, a sum-to-zero constraint, and an L2 penalty. Standard library
-only.
+participant sets, a sum-to-zero constraint, and an L2 penalty, **plus exact
+likelihoods for precedence-constrained orders** (a fixed candidate set of at
+most 6 with pairwise "a before b" requirements; the probability is summed
+over every legal linear extension). Standard library only.
 
 ## Requirements
 
@@ -14,7 +16,7 @@ only.
 ## Commands
 
 ```bash
-python -m unittest discover -s tests -v   # full test suite (35 tests)
+python -m unittest discover -s tests -v   # full test suite (80 tests)
 python demo.py                            # deterministic live demo (~0.1 s)
 ```
 
@@ -51,6 +53,64 @@ on the free `n-1` coordinates, so a **unique minimizer always exists**; there
 is no infeasibility regime to report for valid data (separation cannot diverge
 the estimate because of the penalty).
 
+## Precedence-constrained orders
+
+Given a **fixed candidate set** `C` with `1 ≤ |C| ≤ 6` and a collection of
+strict pairwise precedence edges `(a, b)` — "a must finish ahead of b" — the
+library answers the likelihood of observing an ordering consistent with all
+edges:
+
+```
+L(constraints | theta) = Σ_{π ∈ LE} P(π is the full order over C | theta)
+```
+
+- `LE` is the set of **linear extensions** of the precedence poset, i.e.
+  permutations of the *whole* candidate set satisfying every edge (transitivity
+  is implied). The extensions are enumerated exactly by Kahn-style
+  backtracking over the transitive closure.
+- Candidates that the constraints leave unordered are **alternatives, not
+  ties**: every distinct completion is a separate summand. There is no
+  tie/equivalence-class probability model in this iteration.
+- Each summand is the **full-order** Plackett–Luce probability over exactly
+  `C` (`|C|` stages, every not-yet-picked candidate in the denominator);
+  objects outside `C` never enter any denominator.
+- The probability sum is accumulated in log space with a max-shifted
+  logsumexp, and both `likelihood` and `log_likelihood` are returned along
+  with `n_extensions`.
+- The candidate bound is 6 because enumeration is exact and exhaustive: the
+  worst case (no constraints) is `6! = 720` full orders.
+
+### Worked checks (all reproduced by the tests)
+
+- **No constraints** over `m` candidates: all `m!` full orders partition the
+  sample space, so `n_extensions = m!` and `L = 1` for every `theta`.
+- **Total chain** (e.g. `0<1<2<3`): one extension; `L` equals the single
+  full-order probability from `ranking_probability`.
+- **One edge** on three equally able candidates: 3 of 6 equiprobable orders
+  qualify, `L = 1/2`. With two equally able candidates,
+  `P(a before b) = sigmoid(theta_a − theta_b)`; the two directional events sum
+  to 1 (the pairwise Luce identity).
+- **Contradictory edges** that close a directed cycle (including a self-loop)
+  are rejected with `PLInputError` before any probability is computed; the
+  error names the cycle. Such requirements have zero legal extensions.
+
+### Constrained-order input semantics
+
+- `candidates`: distinct `int` indices in `[0, n)`, non-empty, length ≤ 6
+  (`n = len(theta)`). Strings, floats, and `bool` indices are rejected;
+  duplicates and an empty set are rejected.
+- `constraints`: an iterable of `OrderConstraint` (or `None`/empty). Both
+  endpoints must be ints in `[0, n)` **and** members of `candidates`;
+  `before == after` is rejected; a directed cycle is rejected with the cycle
+  spelled out. Generators are accepted (consumed once).
+- `theta` follows the same contract as everywhere else: finite length-`n`
+  abilities with `sum(theta) = 0`.
+- `return_extensions` must be a real `bool`; when true the result also
+  carries every legal extension as best-first tuples (default off; ≤ 720).
+- The function is purely functional: inputs are never modified, and all
+  validation (theta, candidates, edges, acyclicity) finishes before any
+  enumeration or arithmetic, so a rejected call leaves no partial state.
+
 ## Public interface (`plackett_luce` package)
 
 | Name | Purpose |
@@ -66,6 +126,10 @@ the estimate because of the penalty).
 | `PLInputError(ValueError)` | All input/contract violations; message names the field and index. |
 | `ConvergenceStatus` | `CONVERGED`, `MAX_ITERATIONS`, `LINE_SEARCH_FAILED`, `NUMERICAL_ERROR`. |
 | `PLResult` | `status, converged, iterations, theta, log_likelihood, penalized_objective, log_contributions, gradient_norm, message`. |
+| `MAX_CONSTRAINED_CANDIDATES = 6` | Hard bound on the candidate set of a constrained-order query. |
+| `OrderConstraint(before, after)` | One strict precedence edge: `before` must rank ahead of `after` (transitivity implied). |
+| `constrained_order_probability(constraints, candidates, theta, *, return_extensions=False)` | Validate acyclicity, then sum full-order PL probabilities over all legal linear extensions; returns `ConstrainedOrderResult`. |
+| `ConstrainedOrderResult` | `candidates, n_extensions, log_likelihood, likelihood, extensions`. |
 
 `log_contributions[t]` is the per-observation log likelihood `log P(obs_t |
 theta*)`; their exact-predicate sum (`math.fsum`) equals `log_likelihood`.
@@ -137,6 +201,11 @@ a rejected call cannot leave a partial change.
 - `observations` may be any finite iterable (lists, tuples, generators); each
   element must be an `Observation`.
 
+Constrained-order queries (`constrained_order_probability`) follow the same
+rules: candidate/edge indices reject `bool`, floats, strings, out-of-range
+and non-member values; the candidate set rejects duplicates, emptiness, and
+sizes above 6. All validation precedes enumeration.
+
 ## Accuracy and error accounting
 
 All reported tolerances are on absolute or scaled quantities; tests do not use
@@ -151,6 +220,8 @@ loose tolerances to mask boundary errors.
 | Fitted vs. true abilities (600 deterministic samples) | Statistical recovery check, gauge-aligned | spread `≤ 0.25` |
 | Sum-to-zero of fitted theta | Direct | `≤ 1e-12` absolute |
 | `Σ contributions = log_likelihood` | `math.fsum` | `1e-10` absolute |
+| Constrained-order extension counts | Independent `itertools.permutations` filter (`tests/reference.py`) | exact integer equality |
+| Constrained-order summed likelihood | Independent permutation enumeration + independently coded staged PL probability; hand-computed rationals (`1/m!`, logistic pairs) | `1e-11` absolute; `1e-14` on hand-computed cases |
 
 Expected values in tests come from closed-form expressions, bisection,
 explicit fraction products, or finite differences of the **independent**
@@ -174,17 +245,28 @@ near the optimum on the tested cases.
   favors accuracy and overflow safety over micro-optimization.
 - **Participant sets per observation** rather than a global eligibility mask,
   since disjoint/irregular event lineups are the target use case.
+- **Exact exhaustive enumeration for constrained orders.** The candidate set
+  is capped at 6 (`≤ 720` full orders), so the result is the exact likelihood
+  with a definitive legal-extension count; no approximation, sampling, or
+  dynamic-programming partial-order counting is needed in this range.
 
 ## Known limitations
 
 - Implements exactly the contracted subset: tie-free top-k Plackett–Luce,
-  one global L2 penalty, sum-to-zero gauge. No ties/partial orders with
-  equivalence classes, no object-specific or grouped penalties, no
-  hierarchical/covariate (Bradley–Terry–Luce with features) models, no
-  Bayesian posterior or standard-error output, no claim of standards
-  compliance beyond this contract.
+  one global L2 penalty, sum-to-zero gauge, and exact constrained-order
+  likelihoods for at most 6 candidates. No ties/partial orders with
+  equivalence classes (unordered candidates are summed as distinct
+  completions, never modeled as ties), no object-specific or grouped
+  penalties, no hierarchical/covariate (Bradley–Terry–Luce with features)
+  models, no Bayesian posterior or standard-error output, no claim of
+  standards compliance beyond this contract.
+- Constrained-order queries are an **exact** method: more than 6 candidates
+  are rejected rather than approximated. There is no large-scale approximate
+  inference in this iteration (none was required).
 - `ranking_probability` exponentiates a log probability and can underflow to
-  `0.0`; use `ranking_log_probability` for very small probabilities.
+  `0.0`; use `ranking_log_probability` for very small probabilities. The
+  constrained-order sum itself is accumulated in log space (stable), but the
+  returned `likelihood` field still exponentiates the final log value.
 - Inputs must be materializable in memory; the observation iterable is
   validated before fitting (generators are consumed once).
 - Extremely large fitted `|theta|` (hundreds) are representable but not
@@ -193,10 +275,14 @@ near the optimum on the tested cases.
 ## Repository layout
 
 ```
-plackett_luce/__init__.py     # public API re-exports
-plackett_luce/model.py        # validation, likelihood, Newton solver
-tests/reference.py            # INDEPENDENT reference (no core import)
-tests/test_validation.py      # contract / error-semantics tests
-tests/test_math.py            # analytic extremum, FD derivatives, fit quality
-demo.py                       # deterministic synthetic-data demonstration
+plackett_luce/__init__.py            # public API re-exports
+plackett_luce/model.py               # validation, likelihood, Newton solver,
+                                     # constrained-order enumeration
+tests/reference.py                   # INDEPENDENT reference (no core import)
+tests/test_validation.py             # contract / error-semantics tests
+tests/test_math.py                   # analytic extremum, FD derivatives, fit quality
+tests/test_constraints_validation.py # constrained-order contract / errors
+tests/test_constraints_math.py       # constrained-order counts/likelihoods vs
+                                     # independent permutation enumeration
+demo.py                              # deterministic synthetic-data demonstration
 ```

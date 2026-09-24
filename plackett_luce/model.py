@@ -12,6 +12,11 @@ Public API:
     penalized_objective           -- f(theta) = -loglik + lambda/2 ||theta||^2
     penalized_gradient_free       -- analytic gradient in n-1 free coordinates
     penalized_hessian_free        -- analytic Hessian in n-1 free coordinates
+    OrderConstraint               -- one "before must finish ahead of after" edge
+    ConstrainedOrderResult        -- summed likelihood over legal linear extensions
+    constrained_order_probability -- acyclicity check + sum of full-order
+                                     Plackett-Luce probabilities over every legal
+                                     linear extension (<= 6 candidates)
 
 Model (see README.md for the full derivation):
     For a ranking (r_1, ..., r_k) over participant set A,
@@ -19,6 +24,15 @@ Model (see README.md for the full derivation):
                           sum_{i in A \\ {r_1..r_{j-1}}} exp(theta_i)
     Unranked participants stay in every remaining denominator; objects not in A
     never enter any denominator. k = 0 contributes log P = 0.
+
+Precedence constraints:
+    Given a fixed candidate set C (|C| <= 6) and pairwise "a before b" edges,
+    the constraints must form a DAG (a cycle is rejected with PLInputError
+    before any computation). Every legal linear extension is a distinct FULL
+    ranking of C (candidates never compared by the constraints are NOT tied:
+    each completion is summed separately):
+        L = sum_{pi in LE(constraints)} P(pi is the full order over C | theta)
+    The number of summed extensions is returned as n_extensions.
 """
 from __future__ import annotations
 
@@ -29,19 +43,28 @@ from typing import Sequence, Optional
 
 __all__ = [
     "MAX_OBJECTS",
+    "MAX_CONSTRAINED_CANDIDATES",
     "ConvergenceStatus",
     "PLInputError",
     "Observation",
     "PLResult",
+    "OrderConstraint",
+    "ConstrainedOrderResult",
     "fit_plackett_luce",
     "ranking_log_probability",
     "ranking_probability",
     "penalized_objective",
     "penalized_gradient_free",
     "penalized_hessian_free",
+    "constrained_order_probability",
 ]
 
 MAX_OBJECTS = 20
+
+# Precedence-constrained enumeration is an exact, exhaustive method: the
+# candidate set of a single constrained-order query is capped at 6, so the
+# worst case is 6! = 720 full-order probabilities.
+MAX_CONSTRAINED_CANDIDATES = 6
 
 # Sum-to-zero tolerance for user-supplied initial theta: relative, documented
 # in README. Violations are rejected; the constraint is never silently imposed.
@@ -103,6 +126,40 @@ class PLResult:
     log_contributions: tuple[float, ...]
     gradient_norm: float
     message: str
+
+
+@dataclass(frozen=True)
+class OrderConstraint:
+    """One strict precedence edge: ``before`` must rank ahead of ``after``.
+
+    Transitivity is implied (a path a -> b -> c requires a before c); the
+    library takes the transitive closure. An edge that closes a cycle makes
+    the whole constraint set contradictory and is rejected up front.
+    """
+
+    before: int
+    after: int
+
+
+@dataclass(frozen=True)
+class ConstrainedOrderResult:
+    """Outcome of an exact constrained-order likelihood query.
+
+    candidates:      the validated fixed candidate set.
+    n_extensions:    number of legal linear extensions summed (0 only for a
+                     contradictory input; a contradictory input raises, so a
+                     returned result always has n_extensions >= 1).
+    log_likelihood:  log of the summed probability, stably accumulated.
+    likelihood:      exp(log_likelihood) of the summed probability.
+    extensions:      every legal linear extension as a tuple best-first;
+                     included only when return_extensions=True.
+    """
+
+    candidates: tuple[int, ...]
+    n_extensions: int
+    log_likelihood: float
+    likelihood: float
+    extensions: tuple[tuple[int, ...], ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -226,6 +283,176 @@ def _validate_theta(theta, n: int, where: str = "theta") -> list[float]:
             f"{where}: abilities must satisfy sum(theta) = 0 "
             f"(|sum| = {abs(s):.3g} exceeds {_INITIAL_SUM_TOL:g} * scale)")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Precedence constraints: validation, acyclicity, linear-extension enumeration
+# --------------------------------------------------------------------------- #
+def _validate_candidates(candidates, n: int) -> tuple[int, ...]:
+    where = "candidates"
+    if isinstance(candidates, (str, bytes)) or not hasattr(candidates, "__iter__"):
+        raise PLInputError(f"{where}: expected a sequence of int indices")
+    out = _checked_index_seq(candidates, where, n)
+    if len(out) == 0:
+        raise PLInputError(f"{where}: candidate set must contain at least one object")
+    if len(set(out)) != len(out):
+        dup = sorted({i for i in out if out.count(i) > 1})
+        raise PLInputError(
+            f"{where}: duplicated candidate index/indices {dup}; the fixed "
+            "candidate set must contain distinct objects")
+    if len(out) > MAX_CONSTRAINED_CANDIDATES:
+        raise PLInputError(
+            f"{where}: {len(out)} candidates exceed the exact-enumeration "
+            f"bound of {MAX_CONSTRAINED_CANDIDATES}")
+    return out
+
+
+def _validate_constraints(constraints, candidates: tuple[int, ...], n: int):
+    """Validate precedence edges and return a position-indexed adjacency pair.
+
+    Returns (pred, succ): sets of candidate positions, with the transitive
+    closure taken. A self-loop or any directed cycle is rejected with a
+    PLInputError that names the offending cycle. All checks finish before any
+    probability is computed, so a rejected call leaves no partial state.
+    """
+    if constraints is None:
+        constraints = ()
+    if isinstance(constraints, (str, bytes)) or not hasattr(constraints, "__iter__"):
+        raise PLInputError(
+            "constraints: expected an iterable of OrderConstraint (or None)")
+
+    m = len(candidates)
+    pos = {c: i for i, c in enumerate(candidates)}
+    succ: list[set[int]] = [set() for _ in range(m)]
+    edges = []
+    for idx, con in enumerate(constraints):
+        where = f"constraints[{idx}]"
+        if not isinstance(con, OrderConstraint):
+            raise PLInputError(
+                f"{where}: expected OrderConstraint, got {type(con).__name__}")
+        b = _checked_int(con.before, f"{where}.before",
+                         minimum=0, maximum=n - 1)
+        a = _checked_int(con.after, f"{where}.after",
+                         minimum=0, maximum=n - 1)
+        if b not in pos:
+            raise PLInputError(
+                f"{where}: object {b} is not in the candidate set {list(candidates)}")
+        if a not in pos:
+            raise PLInputError(
+                f"{where}: object {a} is not in the candidate set {list(candidates)}")
+        if b == a:
+            raise PLInputError(
+                f"{where}: object {b} cannot be required to rank before itself")
+        edges.append((pos[b], pos[a]))
+
+    for u, v in edges:
+        succ[u].add(v)
+
+    cycle = _directed_cycle(succ)
+    if cycle is not None:
+        named = " -> ".join(str(candidates[p]) for p in cycle)
+        raise PLInputError(
+            "constraints: precedence edges contain a cycle "
+            f"({named}); contradictory 'before' relations have no legal "
+            "linear extension")
+
+    return _transitive_closure(succ)
+
+
+def _directed_cycle(succ: list[set[int]]):
+    """Return one directed cycle as a list of positions (last node repeated),
+    or None when the graph is acyclic. DFS coloring; |nodes| <= 6."""
+    color = [0] * len(succ)  # 0 unseen, 1 on stack, 2 done
+    stack: list[int] = []
+
+    def dfs(u):
+        color[u] = 1
+        stack.append(u)
+        for v in succ[u]:
+            if color[v] == 1:
+                start = stack.index(v)
+                return stack[start:] + [v]
+            if color[v] == 0:
+                found = dfs(v)
+                if found is not None:
+                    return found
+        stack.pop()
+        color[u] = 2
+        return None
+
+    for u in range(len(succ)):
+        if color[u] == 0:
+            found = dfs(u)
+            if found is not None:
+                return found
+    return None
+
+
+def _transitive_closure(succ: list[set[int]]):
+    """Return (pred, succ) after taking the transitive closure (Floyd style)."""
+    m = len(succ)
+    reach = [set(row) for row in succ]
+    for mid in range(m):
+        for u in range(m):
+            if mid in reach[u]:
+                reach[u].update(reach[mid])
+    pred = [set() for _ in range(m)]
+    for u in range(m):
+        for v in reach[u]:
+            pred[v].add(u)
+    return pred, reach
+
+
+def _enumerate_extensions(pred: list[set[int]], succ: list[set[int]]
+                          ) -> list[tuple[int, ...]]:
+    """All linear extensions of the poset via Kahn-style backtracking.
+
+    Each extension is a tuple of candidate positions best first. Worst case
+    m! = 720 for m = 6. Candidates never ordered against each other are not
+    tied: each distinct completion is enumerated separately.
+    """
+    m = len(succ)
+    remaining_pred = [set(p) for p in pred]
+    chosen: list[int] = []
+    chosen_mark: set[int] = set()
+    extensions: list[tuple[int, ...]] = []
+
+    def backtrack():
+        if len(chosen) == m:
+            extensions.append(tuple(chosen))
+            return
+        ready = [v for v in range(m)
+                 if v not in chosen_mark and not remaining_pred[v]]
+        for v in ready:
+            chosen.append(v)
+            chosen_mark.add(v)
+            newly = [w for w in succ[v] if v in remaining_pred[w]]
+            for w in newly:
+                remaining_pred[w].discard(v)
+            backtrack()
+            for w in newly:
+                remaining_pred[w].add(v)
+            chosen.pop()
+            chosen_mark.discard(v)
+
+    backtrack()
+    return extensions
+
+
+def _full_order_log_probability(order_positions, candidates, theta):
+    """Log Plackett-Luce probability of one FULL order over the candidate set.
+
+    Every candidate that has not been picked yet stays in the denominator.
+    """
+    remaining = list(candidates)
+    lp = 0.0
+    for p in order_positions:
+        winner = candidates[p]
+        m = max(theta[i] for i in remaining)
+        s = math.fsum(math.exp(theta[i] - m) for i in remaining)
+        lp += theta[winner] - (m + math.log(s))
+        remaining.remove(winner)
+    return lp
 
 
 # --------------------------------------------------------------------------- #
@@ -394,6 +621,69 @@ def ranking_log_probability(ranking, theta, participants=None):
 def ranking_probability(ranking, theta, participants=None):
     """Probability of one partial ranking (may underflow for extremely small P)."""
     return math.exp(ranking_log_probability(ranking, theta, participants))
+
+
+def constrained_order_probability(constraints, candidates, theta, *,
+                                  return_extensions=False):
+    """Likelihood of precedence constraints = sum over legal linear extensions.
+
+    Arguments:
+        constraints: iterable of OrderConstraint (None/empty allowed). Each
+            edge "a before b" is a strict precedence requirement; transitivity
+            is implied. A directed cycle (contradictory requirements) raises
+            PLInputError before any probability is computed.
+        candidates:  fixed distinct candidate set (1 <= |candidates| <= 6,
+            indices in [0, n)). Every legal linear extension is a distinct
+            FULL ranking of exactly these candidates; unordered pairs are
+            alternatives, never ties.
+        theta:       length-n finite abilities with sum(theta) = 0.
+        return_extensions: when True, include every enumerated extension
+            (best-first tuples) in the result. Must be a real bool.
+
+    Returns ConstrainedOrderResult with the summed likelihood, its log, and
+    the number of extensions summed. With no constraints the m! full orders
+    partition the sample space (sum = 1); a total chain leaves one extension
+    and the likelihood equals that full order's Plackett-Luce probability.
+    """
+    if not isinstance(return_extensions, bool):
+        raise PLInputError(
+            "return_extensions: expected bool, got "
+            f"{type(return_extensions).__name__}")
+    theta = _validate_theta_arg(theta)
+    n = len(theta)
+    cand = _validate_candidates(candidates, n)
+    pred, succ = _validate_constraints(constraints, cand, n)
+
+    ext_positions = _enumerate_extensions(pred, succ)
+    # Defensive: acyclicity was already proved, so at least one extension must
+    # exist; fail loudly rather than silently returning an empty sum.
+    if not ext_positions:
+        raise PLInputError(
+            "constraints: internal error: acyclic constraints yielded no "
+            "linear extension")
+
+    log_probs = [_full_order_log_probability(order, cand, theta)
+                 for order in ext_positions]
+    log_total = _logsumexp_values(log_probs)
+
+    extensions: tuple[tuple[int, ...], ...] = ()
+    if return_extensions:
+        extensions = tuple(tuple(cand[p] for p in order)
+                           for order in ext_positions)
+
+    return ConstrainedOrderResult(
+        candidates=cand,
+        n_extensions=len(ext_positions),
+        log_likelihood=log_total,
+        likelihood=math.exp(log_total),
+        extensions=extensions,
+    )
+
+
+def _logsumexp_values(values):
+    """log of a sum of probabilities from their logs (stable max subtraction)."""
+    m = max(values)
+    return m + math.log(math.fsum(math.exp(v - m) for v in values))
 
 
 def fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None,

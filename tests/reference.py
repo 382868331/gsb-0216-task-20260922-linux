@@ -6,6 +6,7 @@ difference checks compare the core's analytic derivatives against central
 differences of this independent objective; round-trip agreement with the core
 is never the source of an expected value here.
 """
+import itertools
 import math
 
 
@@ -90,3 +91,44 @@ def two_object_winner_root(m, lam, lo=0.0, hi=100.0, tol=1e-14):
         else:
             hi = mid
     return 0.5 * (lo + hi)
+
+
+# --------------------------------------------------------------------------- #
+# Independent references for precedence-constrained order likelihood
+# --------------------------------------------------------------------------- #
+def legal_extensions(edges, candidates):
+    """Every permutation of candidates satisfying all (a, b) edges.
+
+    Independent of the package: plain itertools.permutations plus a filter.
+    Returns a sorted tuple of best-first tuples.
+    """
+    cands = tuple(candidates)
+    out = []
+    for perm in itertools.permutations(cands):
+        if all(perm.index(a) < perm.index(b) for a, b in edges):
+            out.append(tuple(perm))
+    return tuple(sorted(out))
+
+
+def has_cycle(edges, candidates):
+    """Independent acyclicity check by exhaustive permutation search."""
+    return len(legal_extensions(edges, candidates)) == 0
+
+
+def ref_full_order_prob(order, theta):
+    """Full Plackett-Luce order probability over exactly the ordered objects.
+
+    Staged with its own logsumexp; the candidate set is the order itself.
+    """
+    remaining = list(order)
+    lp = 0.0
+    for winner in order:
+        lp += theta[winner] - logsumexp([theta[i] for i in remaining])
+        remaining.remove(winner)
+    return math.exp(lp)
+
+
+def ref_constrained_likelihood(edges, candidates, theta):
+    """Independent sum of full-order PL probabilities over legal extensions."""
+    exts = legal_extensions(edges, candidates)
+    return sum(ref_full_order_prob(p, theta) for p in exts)
