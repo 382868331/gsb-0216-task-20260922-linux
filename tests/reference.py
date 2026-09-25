@@ -90,3 +90,60 @@ def two_object_winner_root(m, lam, lo=0.0, hi=100.0, tol=1e-14):
         else:
             hi = mid
     return 0.5 * (lo + hi)
+
+
+# --------------------------------------------------------------------------- #
+# Anchored-mode independent references
+# --------------------------------------------------------------------------- #
+def ref_anchored_theta(free_indices, free_vals, anchors, n):
+    """Assemble ambient theta; fixed slots keep the caller constants as given."""
+    theta = [0.0] * n
+    for idx, val in anchors.items():
+        theta[idx] = val
+    for idx, v in zip(free_indices, free_vals):
+        theta[idx] = v
+    return theta
+
+
+def ref_anchored_objective(x, records, n, lam, anchors):
+    """-loglik + lambda/2 sum over FREE coordinates only."""
+    free = [i for i in range(n) if i not in anchors]
+    theta = ref_anchored_theta(free, x, anchors, n)
+    ll = 0.0
+    for ranking, participants in records:
+        ll += ref_log_prob(ranking, participants, theta)
+    pen = 0.5 * lam * sum(theta[i] * theta[i] for i in free)
+    return -ll + pen
+
+
+def fd_anchored_gradient(x, records, n, lam, anchors, h=1e-6):
+    g = [0.0] * len(x)
+    for i in range(len(x)):
+        xp = list(x)
+        xm = list(x)
+        xp[i] += h
+        xm[i] -= h
+        g[i] = (ref_anchored_objective(xp, records, n, lam, anchors)
+                - ref_anchored_objective(xm, records, n, lam, anchors)) \
+               / (2.0 * h)
+    return g
+
+
+def fd_anchored_hessian(x, records, n, lam, anchors, h=1e-4):
+    m = len(x)
+    H = [[0.0] * m for _ in range(m)]
+    f = lambda y: ref_anchored_objective(y, records, n, lam, anchors)
+    for i in range(m):
+        for j in range(i, m):
+            ypp = list(x)
+            ypm = list(x)
+            ymp = list(x)
+            ymm = list(x)
+            ypp[i] += h; ypp[j] += h
+            ypm[i] += h; ypm[j] -= h
+            ymp[i] -= h; ymp[j] += h
+            ymm[i] -= h; ymm[j] -= h
+            val = (f(ypp) - f(ypm) - f(ymp) + f(ymm)) / (4.0 * h * h)
+            H[i][j] = val
+            H[j][i] = val
+    return H

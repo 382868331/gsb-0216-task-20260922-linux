@@ -15,6 +15,7 @@ from plackett_luce import (
     ConvergenceStatus,
     Observation,
     PLInputError,
+    fit_anchored,
     fit_plackett_luce,
     ranking_probability,
 )
@@ -106,6 +107,39 @@ def main():
     print(f"  P(0>1 among participants {{0,1,4}}) = {p_subset:.6f}")
     print("  (unranked object 4 stays in every remaining denominator)")
 
+    # Anchored fit: object 4 is fixed at a caller constant; the other four
+    # abilities are optimized WITHOUT any sum-to-zero constraint, and the
+    # penalty acts on the four free coordinates only. Object 4 still enters
+    # every denominator of the rounds it participated in.
+    anchor_value = -0.7
+    anchored = fit_anchored(observations, N_OBJECTS, {N_OBJECTS - 1: anchor_value},
+                            lam=LAM)
+    print("\n-- anchored fit: object", N_OBJECTS - 1,
+          f"fixed at {anchor_value:+.2f} --")
+    print("status        :", anchored.status.value)
+    print("iterations    :", anchored.iterations)
+    print("gradient norm :", f"{anchored.gradient_norm:.3e}")
+    print("boundary KKT  :", f"{anchored.boundary_kkt_residual:.3e}")
+    for i in range(N_OBJECTS):
+        tag = " (fixed)" if i == N_OBJECTS - 1 else ""
+        print(f"  theta_{i} = {anchored.theta[i]:+10.4f}{tag}")
+    print("sum(theta) is nonzero by design:",
+          f"{math.fsum(anchored.theta):+.4f}")
+
+    # Actual active bound: cap a free object's ability at a small finite
+    # value; the unconstrained optimum is larger, so the constrained solver
+    # must finish ON the wall with a KKT-correct gradient.
+    small_cap = 0.05
+    bounded = fit_anchored(
+        observations, N_OBJECTS, {N_OBJECTS - 1: anchor_value}, lam=LAM,
+        bounds={0: (-3.0, small_cap)})
+    print("\n-- active box boundary: free object 0 capped at",
+          f"{small_cap:+.2f} --")
+    print("status        :", bounded.status.value)
+    print("theta_0       :", f"{bounded.theta[0]:+.6f}", "(on upper face)")
+    print("theta_4       :", f"{bounded.theta[4]:+.6f}", "(anchor unchanged)")
+    print("boundary KKT  :", f"{bounded.boundary_kkt_residual:.3e}")
+
     # Actual rejection boundary: duplicated object inside one ranking.
     print("\n-- rejection boundary: duplicated object in a ranking --")
     bad = [Observation((0, 1, 0)), Observation((2,))]
@@ -115,10 +149,23 @@ def main():
         print("PLInputError raised as required:")
         print(" ", exc)
 
+    # Anchor-specific rejection: an unknown anchored object is refused before
+    # any iteration.
+    print("\n-- rejection boundary: unknown anchored object --")
+    try:
+        fit_anchored(observations, N_OBJECTS, {N_OBJECTS + 7: 0.0}, lam=LAM)
+    except PLInputError as exc:
+        print("PLInputError raised as required:")
+        print(" ", exc)
+
     elapsed = time.perf_counter() - started
     print(f"\nelapsed: {elapsed:.2f} s")
     if result.status != ConvergenceStatus.CONVERGED:
         raise SystemExit("demo fit did not converge")
+    if anchored.status != ConvergenceStatus.CONVERGED:
+        raise SystemExit("anchored demo fit did not converge")
+    if bounded.status != ConvergenceStatus.CONVERGED:
+        raise SystemExit("bounded demo fit did not converge")
 
 
 if __name__ == "__main__":

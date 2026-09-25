@@ -4,10 +4,15 @@ Standard library only. See module docstrings and README.md.
 """
 from .model import (
     MAX_OBJECTS,
+    Bound,
     ConvergenceStatus,
     PLInputError,
     Observation,
     PLResult,
+    anchored_gradient_free,
+    anchored_hessian_free,
+    anchored_penalized_objective,
+    fit_anchored,
     fit_plackett_luce,
     penalized_gradient_free,
     penalized_hessian_free,
@@ -18,10 +23,15 @@ from .model import (
 
 __all__ = [
     "MAX_OBJECTS",
+    "Bound",
     "ConvergenceStatus",
     "PLInputError",
     "Observation",
     "PLResult",
+    "anchored_gradient_free",
+    "anchored_hessian_free",
+    "anchored_penalized_objective",
+    "fit_anchored",
     "fit_plackett_luce",
     "ranking_log_probability",
     "ranking_probability",
