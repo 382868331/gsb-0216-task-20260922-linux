@@ -90,3 +90,63 @@ def two_object_winner_root(m, lam, lo=0.0, hi=100.0, tol=1e-14):
         else:
             hi = mid
     return 0.5 * (lo + hi)
+
+
+def ref_theta_anchored(x, free_idx, anchors, n):
+    """Ambient theta from free coordinates plus fixed anchor constants.
+
+    Anchors are placed verbatim -- never re-centered -- and the free
+    coordinates occupy exactly the non-anchored positions.
+    """
+    theta = [0.0] * n
+    for i, v in anchors.items():
+        theta[i] = v
+    for j, i in enumerate(free_idx):
+        theta[i] = x[j]
+    return theta
+
+
+def ref_objective_anchored(x, records, n, lam, free_idx, anchors):
+    """-loglik + lambda/2 * sum over FREE coordinates only (no gauge)."""
+    theta = ref_theta_anchored(x, free_idx, anchors, n)
+    ll = 0.0
+    for ranking, participants in records:
+        ll += ref_log_prob(ranking, participants, theta)
+    return -ll + 0.5 * lam * sum(xj * xj for xj in x)
+
+
+def fd_gradient_anchored(x, records, n, lam, free_idx, anchors, h=1e-6):
+    g = [0.0] * len(x)
+    for j in range(len(x)):
+        xp = list(x)
+        xm = list(x)
+        xp[j] += h
+        xm[j] -= h
+        g[j] = (ref_objective_anchored(xp, records, n, lam, free_idx, anchors)
+                - ref_objective_anchored(xm, records, n, lam, free_idx, anchors)
+                ) / (2.0 * h)
+    return g
+
+
+def anchored_two_object_root(m, lam, anchor, lo=-100.0, hi=100.0, tol=1e-14):
+    """Independent bisection root for one free ability against one anchor.
+
+    m observations of the free object beating the anchored object (ability
+    fixed at 'anchor'). Stationarity of the free coordinate t:
+        lam * t = m * (1 - exp(t) / (exp(t) + exp(anchor)))
+    """
+    def residual(t):
+        p_free = 1.0 / (1.0 + math.exp(anchor - t))
+        return lam * t - m * (1.0 - p_free)
+
+    flo = residual(lo)
+    for _ in range(400):
+        mid = 0.5 * (lo + hi)
+        fm = residual(mid)
+        if abs(fm) < tol or 0.5 * (hi - lo) < 1e-13:
+            return mid
+        if (flo < 0.0) == (fm < 0.0):
+            lo, flo = mid, fm
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)

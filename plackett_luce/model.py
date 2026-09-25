@@ -19,10 +19,20 @@ Model (see README.md for the full derivation):
                           sum_{i in A \\ {r_1..r_{j-1}}} exp(theta_i)
     Unranked participants stay in every remaining denominator; objects not in A
     never enter any denominator. k = 0 contributes log P = 0.
+
+Anchored fitting (fit_plackett_luce(..., anchors=..., bounds=...)):
+    With at least one anchor the sum-to-zero gauge is dropped entirely; the
+    anchored abilities are held at their given constants (never re-centered,
+    never Newton-updated) and the L2 penalty applies to the free abilities
+    only. Free abilities may carry finite box bounds, handled by a projected
+    (active-set) Newton step with Armijo backtracking -- never by clipping an
+    unconstrained fit. Anchored objects still enter every denominator their
+    participant set implies.
 """
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Sequence, Optional
@@ -50,6 +60,13 @@ _INITIAL_SUM_TOL = 1e-10
 _ARMIJO_C1 = 1e-4
 _STEP_SHRINK = 0.5
 _MAX_LINESEARCH_TRIES = 80
+
+# Rounding-scale slack for the anchored Armijo test: once the achievable
+# objective decrease falls below the resolution of f itself (~1e-16 relative
+# per evaluation, accumulated over a batch), a strict decrease test can no
+# longer be decided. The slack only releases steps whose required decrease is
+# already far below machine resolution; genuine steps are unaffected.
+_ARMIJO_ROUNDING_SLACK = 1e-13
 
 
 class ConvergenceStatus(str, Enum):
@@ -103,6 +120,9 @@ class PLResult:
     log_contributions: tuple[float, ...]
     gradient_norm: float
     message: str
+    # Infinity-norm KKT residual of the box constraints; only meaningful when
+    # bounds were supplied (anchored fit), otherwise None.
+    boundary_kkt_residual: Optional[float] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -228,14 +248,111 @@ def _validate_theta(theta, n: int, where: str = "theta") -> list[float]:
     return out
 
 
+def _validate_theta_finite(theta, n: int, where: str) -> list[float]:
+    """Length-n finite abilities without the sum-to-zero requirement."""
+    if isinstance(theta, (str, bytes)) or not hasattr(theta, "__iter__"):
+        raise PLInputError(f"{where}: expected a sequence of {n} real numbers")
+    vals = list(theta)
+    if len(vals) != n:
+        raise PLInputError(
+            f"{where}: expected length {n}, got {len(vals)}")
+    return [_checked_finite_float(v, f"{where}[{pos}]")
+            for pos, v in enumerate(vals)]
+
+
+def _validate_anchors(anchors, n: int) -> dict[int, float]:
+    """Validate caller-fixed abilities; reject duplicates, unknown objects,
+    and non-finite values before anything is computed."""
+    if anchors is None:
+        return {}
+    if isinstance(anchors, Mapping):
+        pairs = list(anchors.items())
+    elif isinstance(anchors, (str, bytes)) or not hasattr(anchors, "__iter__"):
+        raise PLInputError(
+            "anchors: expected a mapping {index: value} or an iterable of "
+            "(index, value) pairs")
+    else:
+        pairs = []
+        for pos, item in enumerate(anchors):
+            where = f"anchors[{pos}]"
+            if isinstance(item, (str, bytes)) or not hasattr(item, "__len__") \
+                    or len(item) != 2:
+                raise PLInputError(f"{where}: expected an (index, value) pair")
+            pairs.append((item[0], item[1]))
+    out: dict[int, float] = {}
+    for pos, (idx, val) in enumerate(pairs):
+        where = f"anchors[{pos}]"
+        _reject_bool(idx, f"{where}.index")
+        if not isinstance(idx, int):
+            raise PLInputError(
+                f"{where}.index: expected int, got {type(idx).__name__}")
+        if idx < 0 or idx >= n:
+            raise PLInputError(
+                f"{where}.index: object {idx} is outside [0, {n - 1}]")
+        if idx in out:
+            raise PLInputError(
+                f"{where}.index: duplicate anchor for object {idx}")
+        out[idx] = _checked_finite_float(val, f"{where}.value")
+    return out
+
+
+def _validate_bounds(bounds, n: int, anchored: set) -> dict[int, tuple[float, float]]:
+    """Validate finite box bounds for free (non-anchored) abilities."""
+    if bounds is None:
+        return {}
+    if isinstance(bounds, Mapping):
+        pairs = list(bounds.items())
+    elif isinstance(bounds, (str, bytes)) or not hasattr(bounds, "__iter__"):
+        raise PLInputError(
+            "bounds: expected a mapping {index: (lo, hi)} or an iterable of "
+            "(index, (lo, hi)) pairs")
+    else:
+        pairs = []
+        for pos, item in enumerate(bounds):
+            where = f"bounds[{pos}]"
+            if isinstance(item, (str, bytes)) or not hasattr(item, "__len__") \
+                    or len(item) != 2:
+                raise PLInputError(f"{where}: expected an (index, (lo, hi)) pair")
+            pairs.append((item[0], item[1]))
+    out: dict[int, tuple[float, float]] = {}
+    for pos, (idx, lh) in enumerate(pairs):
+        where = f"bounds[{pos}]"
+        _reject_bool(idx, f"{where}.index")
+        if not isinstance(idx, int):
+            raise PLInputError(
+                f"{where}.index: expected int, got {type(idx).__name__}")
+        if idx < 0 or idx >= n:
+            raise PLInputError(
+                f"{where}.index: object {idx} is outside [0, {n - 1}]")
+        if idx in anchored:
+            raise PLInputError(
+                f"{where}.index: object {idx} is anchored; anchored abilities "
+                "are fixed constants and cannot carry bounds")
+        if idx in out:
+            raise PLInputError(
+                f"{where}.index: duplicate bounds for object {idx}")
+        if isinstance(lh, (str, bytes)) or not hasattr(lh, "__len__") \
+                or len(lh) != 2:
+            raise PLInputError(f"{where}.value: expected a (lo, hi) pair")
+        lo = _checked_finite_float(lh[0], f"{where}.value[0]")
+        hi = _checked_finite_float(lh[1], f"{where}.value[1]")
+        if lo > hi:
+            raise PLInputError(
+                f"{where}.value: lower bound {lo!r} exceeds upper bound {hi!r}")
+        out[idx] = (lo, hi)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Core likelihood accumulation (stable logsumexp, analytic gradient & Hessian)
 # --------------------------------------------------------------------------- #
-def _fill(normalized, theta, lam, want_derivs):
+def _fill(normalized, theta, lam, want_derivs, penalty_indices=None):
     """Return (objective, log_likelihood, per-obs log contributions, g, H).
 
     Ambient coordinates (length n). g/H include the lambda penalty. Stages use
     logsumexp with per-stage max subtraction for numerical stability.
+    penalty_indices=None penalizes every coordinate (sum-to-zero gauge);
+    otherwise only the listed (free) coordinates are penalized.
     """
     n = len(theta)
     g = [0.0] * n
@@ -271,10 +388,11 @@ def _fill(normalized, theta, lam, want_derivs):
         total_ll += ll
         contributions.append(ll)
 
-    penalty_half = 0.5 * lam * math.fsum(t * t for t in theta)
+    pen_idx = range(n) if penalty_indices is None else penalty_indices
+    penalty_half = 0.5 * lam * math.fsum(theta[i] * theta[i] for i in pen_idx)
     objective = -total_ll + penalty_half
     if want_derivs:
-        for i in range(n):
+        for i in pen_idx:
             g[i] += lam * theta[i]
             H[i][i] += lam
     return objective, total_ll, contributions, g, H
@@ -328,6 +446,207 @@ def _theta_from_free(x):
 def _objective_only(normalized, theta, lam):
     obj, _, _, _, _ = _fill(normalized, theta, lam, False)
     return obj
+
+
+def _objective_only_anchored(normalized, theta, lam, free_idx):
+    obj, _, _, _, _ = _fill(normalized, theta, lam, False,
+                            penalty_indices=free_idx)
+    return obj
+
+
+def _kkt_residual_free(x, gf, lo_b, hi_b):
+    """Infinity-norm KKT residual of the box constraints at a feasible point.
+
+    Interior coordinate: |g|. At the lower bound: max(0, -g) (a descent
+    direction would point below the bound). At the upper bound: max(0, g).
+    """
+    kkt = 0.0
+    for j in range(len(x)):
+        gj = gf[j]
+        lo, hi = lo_b[j], hi_b[j]
+        if lo is not None and x[j] == lo:
+            r = max(0.0, -gj)
+        elif hi is not None and x[j] == hi:
+            r = max(0.0, gj)
+        else:
+            r = abs(gj)
+        if r > kkt:
+            kkt = r
+    return kkt
+
+
+def _solve_anchored(norm, theta, free_idx, anchor_map, bound_map, lam,
+                    max_iter, gtol):
+    """Projected (active-set) Newton over the free coordinates only.
+
+    Anchored abilities stay exactly at their constants inside theta for every
+    likelihood/gradient/Hessian evaluation -- they shape the denominators but
+    are never part of a Newton update and are never re-centered. Bounds are
+    enforced by clamping each backtracked trial step onto the box (a projected
+    step), never by fitting unconstrained and clipping afterwards.
+    """
+    m = len(free_idx)
+    lo_b = [bound_map[i][0] if i in bound_map else None for i in free_idx]
+    hi_b = [bound_map[i][1] if i in bound_map else None for i in free_idx]
+    has_bounds = bool(bound_map)
+
+    x = [theta[i] for i in free_idx]
+    for j in range(m):
+        lo, hi = lo_b[j], hi_b[j]
+        if lo is not None and x[j] < lo:
+            raise PLInputError(
+                f"initial: free ability for object {free_idx[j]} is "
+                f"{x[j]!r}, below its lower bound {lo!r}")
+        if hi is not None and x[j] > hi:
+            raise PLInputError(
+                f"initial: free ability for object {free_idx[j]} is "
+                f"{x[j]!r}, above its upper bound {hi!r}")
+
+    def assemble(xv):
+        t = list(theta)
+        for j, i in enumerate(free_idx):
+            t[i] = xv[j]
+        return t
+
+    # All abilities fixed: evaluate the likelihood and contributions only.
+    if m == 0:
+        obj, ll, contribs, _, _ = _fill(norm, theta, lam, False,
+                                        penalty_indices=())
+        return PLResult(
+            status=ConvergenceStatus.CONVERGED, converged=True, iterations=0,
+            theta=tuple(theta), log_likelihood=ll, penalized_objective=obj,
+            log_contributions=tuple(contribs), gradient_norm=0.0,
+            message="all abilities anchored: evaluated likelihood and "
+                    "per-observation contributions without optimization",
+            boundary_kkt_residual=0.0 if has_bounds else None)
+
+    status = ConvergenceStatus.MAX_ITERATIONS
+    message = ""
+    steps = 0
+
+    for it in range(max_iter + 1):
+        theta = assemble(x)
+        obj, ll, contribs, g, H = _fill(norm, theta, lam, True,
+                                        penalty_indices=free_idx)
+        gf = [g[i] for i in free_idx]
+        gnorm = max((abs(v) for v in gf), default=0.0)
+        kkt = _kkt_residual_free(x, gf, lo_b, hi_b)
+        stationarity = kkt if has_bounds else gnorm
+
+        if not math.isfinite(obj) or not all(map(math.isfinite, gf)):
+            status = ConvergenceStatus.NUMERICAL_ERROR
+            message = "non-finite objective or gradient encountered"
+            steps = it
+            break
+        if stationarity <= gtol:
+            status = ConvergenceStatus.CONVERGED
+            kind = "boundary KKT residual" if has_bounds else \
+                "free gradient infinity norm"
+            message = (f"{kind} {stationarity:.3e} <= gtol {gtol:.3e} "
+                       f"after {it} Newton step(s)")
+            steps = it
+            break
+        if it == max_iter:
+            status = ConvergenceStatus.MAX_ITERATIONS
+            message = (f"budget of {max_iter} Newton steps exhausted with "
+                       f"stationarity measure {stationarity:.3e} > gtol "
+                       f"{gtol:.3e}")
+            steps = max_iter
+            break
+
+        # Active set: coordinates pinned at a bound whose gradient does not
+        # point back into the feasible box stay out of the Newton system.
+        inactive = []
+        for j in range(m):
+            lo, hi = lo_b[j], hi_b[j]
+            if lo is not None and x[j] == lo and gf[j] >= 0.0:
+                continue
+            if hi is not None and x[j] == hi and gf[j] <= 0.0:
+                continue
+            inactive.append(j)
+
+        d = [0.0] * m
+        if inactive:
+            Hsub = [[H[free_idx[a]][free_idx[b]] for b in inactive]
+                    for a in inactive]
+            gsub = [gf[j] for j in inactive]
+            diag_scale = max(Hsub[p][p] for p in range(len(inactive)))
+            L = None
+            for tau in (0.0, 1e-12, 1e-10, 1e-8, 1e-6):
+                Hj = [row[:] for row in Hsub]
+                if tau:
+                    bump = tau * diag_scale
+                    for p in range(len(inactive)):
+                        Hj[p][p] += bump
+                try:
+                    L = _cholesky(Hj)
+                    break
+                except PLInputError:
+                    continue
+            if L is None:
+                status = ConvergenceStatus.NUMERICAL_ERROR
+                message = ("Newton Hessian (free block) could not be factored "
+                           "as positive definite")
+                steps = it
+                break
+            dsub = _solve_cholesky(L, [-v for v in gsub])
+            for p, j in enumerate(inactive):
+                d[j] = dsub[p]
+
+        directional = math.fsum(gf[j] * d[j] for j in range(m))
+        if directional >= 0.0 or not math.isfinite(directional):
+            status = ConvergenceStatus.NUMERICAL_ERROR
+            message = "Newton direction is not a descent direction"
+            steps = it
+            break
+
+        alpha = 1.0
+        accepted = False
+        for _ in range(_MAX_LINESEARCH_TRIES):
+            xn = [x[j] + alpha * d[j] for j in range(m)]
+            for j in range(m):  # project the trial point onto the box
+                if lo_b[j] is not None and xn[j] < lo_b[j]:
+                    xn[j] = lo_b[j]
+                if hi_b[j] is not None and xn[j] > hi_b[j]:
+                    xn[j] = hi_b[j]
+            step = [xn[j] - x[j] for j in range(m)]
+            if max((abs(s) for s in step), default=0.0) == 0.0:
+                break  # projected step vanished: cannot make progress
+            fn = _objective_only_anchored(norm, assemble(xn), lam, free_idx)
+            actual_dir = math.fsum(gf[j] * step[j] for j in range(m))
+            slack = _ARMIJO_ROUNDING_SLACK * max(1.0, abs(obj))
+            if math.isfinite(fn) \
+                    and fn <= obj + _ARMIJO_C1 * actual_dir + slack:
+                x = xn
+                accepted = True
+                break
+            alpha *= _STEP_SHRINK
+
+        if not accepted:
+            status = ConvergenceStatus.LINE_SEARCH_FAILED
+            message = (f"backtracking failed after {_MAX_LINESEARCH_TRIES} "
+                       f"halvings at iteration {it + 1}")
+            steps = it
+            break
+
+    theta = assemble(x)
+    final_obj, final_ll, final_contribs, fg, _ = _fill(
+        norm, theta, lam, True, penalty_indices=free_idx)
+    fgf = [fg[i] for i in free_idx]
+    final_gnorm = max((abs(v) for v in fgf), default=0.0)
+    final_kkt = _kkt_residual_free(x, fgf, lo_b, hi_b)
+    return PLResult(
+        status=status,
+        converged=(status == ConvergenceStatus.CONVERGED),
+        iterations=steps,
+        theta=tuple(theta),
+        log_likelihood=final_ll,
+        penalized_objective=final_obj,
+        log_contributions=tuple(final_contribs),
+        gradient_norm=final_gnorm,
+        message=message,
+        boundary_kkt_residual=final_kkt if has_bounds else None,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -397,7 +716,7 @@ def ranking_probability(ranking, theta, participants=None):
 
 
 def fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None,
-                      max_iter=100, gtol=1e-10):
+                      max_iter=100, gtol=1e-10, anchors=None, bounds=None):
     """Fit penalized Plackett-Luce abilities by backtracking Newton.
 
     Arguments:
@@ -410,6 +729,19 @@ def fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None,
         max_iter:     Newton-step budget (int >= 1, bool rejected).
         gtol:         convergence tolerance on the reduced gradient infinity
             norm (finite float > 0).
+        anchors:      optional mapping {index: ability} (or iterable of
+            (index, ability) pairs) fixing some abilities at caller-supplied
+            finite constants. With at least one anchor the sum-to-zero
+            constraint is dropped entirely, the L2 penalty applies to the
+            free abilities only, and anchored values are never re-centered
+            or updated. Duplicate, out-of-range, or non-finite anchors are
+            rejected. With no anchors the legacy sum(theta)=0 behavior is
+            kept unchanged.
+        bounds:       optional mapping {index: (lo, hi)} of finite box bounds
+            for free abilities (requires at least one anchor). Enforced by a
+            projected active-set Newton step with Armijo backtracking; the
+            boundary KKT residual is reported on the result. Bounds on
+            anchored objects, lo > hi, or non-finite endpoints are rejected.
 
     Returns PLResult. Budget exhaustion is reported as
     ConvergenceStatus.MAX_ITERATIONS; invalid/infeasible inputs raise
@@ -419,6 +751,26 @@ def fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None,
     lam = _checked_finite_float(lam, "lam", positive=True)
     max_iter = _checked_int(max_iter, "max_iter", minimum=1)
     gtol = _checked_finite_float(gtol, "gtol", positive=True)
+
+    anchor_map = _validate_anchors(anchors, n)
+    if anchor_map:
+        bound_map = _validate_bounds(bounds, n, set(anchor_map))
+        norm = _normalize(observations, n)
+        if initial is None:
+            theta = [0.0] * n
+        else:
+            # Anchored mode drops sum(theta)=0, so the initial point only
+            # needs to be finite; anchored entries are overridden below.
+            theta = _validate_theta_finite(initial, n, "initial")
+        for i, v in anchor_map.items():
+            theta[i] = v
+        free_idx = [i for i in range(n) if i not in anchor_map]
+        return _solve_anchored(norm, theta, free_idx, anchor_map, bound_map,
+                               lam, max_iter, gtol)
+    if bounds is not None:
+        raise PLInputError(
+            "bounds: box bounds require anchored fitting; pass at least one "
+            "anchor so the sum-to-zero gauge is dropped")
 
     if initial is None:
         theta = [0.0] * n

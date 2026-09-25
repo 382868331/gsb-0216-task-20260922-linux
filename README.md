@@ -2,8 +2,9 @@
 
 Reusable, dependency-free Python library for fitting **Plackett–Luce abilities
 from partial top-k, tie-free rankings** with optional per-observation
-participant sets, a sum-to-zero constraint, and an L2 penalty. Standard library
-only.
+participant sets, a sum-to-zero constraint, an L2 penalty, and optional
+**anchored (fixed) abilities with box bounds** on the free ones. Standard
+library only.
 
 ## Requirements
 
@@ -14,7 +15,7 @@ only.
 ## Commands
 
 ```bash
-python -m unittest discover -s tests -v   # full test suite (35 tests)
+python -m unittest discover -s tests -v   # full test suite (56 tests)
 python demo.py                            # deterministic live demo (~0.1 s)
 ```
 
@@ -51,13 +52,62 @@ on the free `n-1` coordinates, so a **unique minimizer always exists**; there
 is no infeasibility regime to report for valid data (separation cannot diverge
 the estimate because of the penalty).
 
+## Anchored fitting (fixed abilities)
+
+`fit_plackett_luce(..., anchors=..., bounds=...)` lets the caller pin some
+abilities at known constants and optimize only the rest:
+
+- `anchors`: mapping `{object_index: ability}` (or an iterable of
+  `(index, ability)` pairs). Values must be finite; indices must be valid
+  `int` object ids. **Duplicate anchors, unknown objects, and non-finite
+  values are rejected up front** with `PLInputError`.
+- With **at least one anchor**, the `Σ theta = 0` gauge is **dropped
+  entirely** (no re-centering of anything, anchored or free) and the L2
+  penalty applies to the **free abilities only**:
+  `f = -loglik + (lambda/2) * Σ_{i free} theta_i²`. With **no anchors** the
+  legacy behavior is kept exactly: sum-to-zero gauge, penalty on all
+  coordinates, reduced `(n-1)`-coordinate Newton.
+- Anchored objects still enter **every denominator their participant set
+  implies** (ranked or unranked); they shape the probabilities but are never
+  part of a Newton update. Gradient and Hessian are taken over the free
+  block only.
+- If **all** objects are anchored, no optimization happens: the call simply
+  evaluates the likelihood and the per-observation contributions at the
+  fixed abilities (`iterations = 0`, penalty term exactly 0).
+- `initial` in anchored mode must be finite length-`n` but does **not** need
+  to sum to zero; anchored entries are overridden by the anchor constants.
+
+### Box bounds on free abilities
+
+- `bounds`: mapping `{object_index: (lo, hi)}` (or iterable of pairs) with
+  **finite** `lo <= hi`, only for free (non-anchored) objects, and only in
+  anchored mode. Bounds on anchored objects, `lo > hi`, non-finite
+  endpoints, or bounds without any anchor are rejected. An `initial` point
+  outside its bounds is rejected, never silently clipped.
+- Bounds are enforced by a **projected active-set Newton method**: at each
+  iteration, coordinates pinned at a bound whose gradient does not point
+  back into the box are held out of the Newton system; the remaining free
+  block takes a Newton step, each backtracked trial point is **clamped onto
+  the box**, and an Armijo test on the actual projected step accepts or
+  halves. This is *not* "fit unconstrained, then clip" — every iterate is
+  feasible and the anchors never move during backtracking.
+- The result reports `boundary_kkt_residual`: the infinity-norm KKT residual
+  of the box constraints (`|g_i|` interior, `max(0, -g_i)` at the lower
+  bound, `max(0, g_i)` at the upper bound). With bounds it is also the
+  convergence measure (`<= gtol`). It is `None` for legacy (anchor-free)
+  fits and for anchored fits without bounds.
+- The anchored Armijo test allows a documented rounding slack of
+  `1e-13 * max(1, |f|)`: once the achievable decrease falls below the
+  resolution of the accumulated objective itself, a strict decrease test is
+  undecidable in floating point. Genuine steps are unaffected.
+
 ## Public interface (`plackett_luce` package)
 
 | Name | Purpose |
 |---|---|
 | `MAX_OBJECTS = 20` | Hard interface bound on `n_objects`. |
 | `Observation(ranking=(), participants=None)` | One sample. `ranking`: distinct `int` indices, best first, length `k ≤ n`. `participants`: distinct indices, or `None` for all `n` objects. |
-| `fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None, max_iter=100, gtol=1e-10)` | Penalized MLE by backtracking Newton. |
+| `fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None, max_iter=100, gtol=1e-10, anchors=None, bounds=None)` | Penalized MLE by backtracking Newton; optional anchored/bounded fitting (see above). |
 | `ranking_log_probability(ranking, theta, participants=None)` | Stable log probability of one partial ranking. |
 | `ranking_probability(...)` | `exp` of the above (may underflow for tiny probabilities). |
 | `penalized_objective(observations, theta, lam)` | Scalar objective at a sum-zero point. |
@@ -65,7 +115,7 @@ the estimate because of the penalty).
 | `penalized_hessian_free(...)` | Analytic Hessian in the free coordinates. |
 | `PLInputError(ValueError)` | All input/contract violations; message names the field and index. |
 | `ConvergenceStatus` | `CONVERGED`, `MAX_ITERATIONS`, `LINE_SEARCH_FAILED`, `NUMERICAL_ERROR`. |
-| `PLResult` | `status, converged, iterations, theta, log_likelihood, penalized_objective, log_contributions, gradient_norm, message`. |
+| `PLResult` | `status, converged, iterations, theta, log_likelihood, penalized_objective, log_contributions, gradient_norm, message, boundary_kkt_residual` (last field set only for bounded anchored fits). |
 
 `log_contributions[t]` is the per-observation log likelihood `log P(obs_t |
 theta*)`; their exact-predicate sum (`math.fsum`) equals `log_likelihood`.
@@ -151,6 +201,10 @@ loose tolerances to mask boundary errors.
 | Fitted vs. true abilities (600 deterministic samples) | Statistical recovery check, gauge-aligned | spread `≤ 0.25` |
 | Sum-to-zero of fitted theta | Direct | `≤ 1e-12` absolute |
 | `Σ contributions = log_likelihood` | `math.fsum` | `1e-10` absolute |
+| Anchored two-object extremum | Independent bisection root of `λt = m·(1 − σ(t − a))` | `1e-10` absolute |
+| Anchored free gradient at optimum | Central FD of the independent anchored objective | `< 1e-5` absolute |
+| Anchored per-observation contributions | Independent reference logsumexp | `1e-12` absolute |
+| Boundary KKT residual at an active bound | Reported by solver | `≤ 1e-10` |
 
 Expected values in tests come from closed-form expressions, bisection,
 explicit fraction products, or finite differences of the **independent**
@@ -174,6 +228,10 @@ near the optimum on the tested cases.
   favors accuracy and overflow safety over micro-optimization.
 - **Participant sets per observation** rather than a global eligibility mask,
   since disjoint/irregular event lineups are the target use case.
+- **Anchors drop the gauge rather than re-centering.** Fixing some abilities
+  gives the remaining ones an absolute scale, so the sum-to-zero constraint
+  would be wrong (it would move the anchors). The penalty shrinks free
+  abilities toward 0, keeping the anchored problem strictly convex.
 
 ## Known limitations
 
@@ -198,5 +256,6 @@ plackett_luce/model.py        # validation, likelihood, Newton solver
 tests/reference.py            # INDEPENDENT reference (no core import)
 tests/test_validation.py      # contract / error-semantics tests
 tests/test_math.py            # analytic extremum, FD derivatives, fit quality
+tests/test_anchored.py         # anchors, bounds/KKT, all-fixed evaluation
 demo.py                       # deterministic synthetic-data demonstration
 ```

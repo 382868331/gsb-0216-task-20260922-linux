@@ -115,10 +115,46 @@ def main():
         print("PLInputError raised as required:")
         print(" ", exc)
 
+    # Anchored fit: object 0 pinned at its true ability as a fixed anchor.
+    # The sum-to-zero gauge is dropped; the L2 penalty now applies to the
+    # free abilities only.
+    print("\n-- anchored fit: object 0 fixed at theta = 0.9 --")
+    anchored = fit_plackett_luce(observations, N_OBJECTS, lam=LAM,
+                                 anchors={0: TRUE_THETA[0]})
+    print("status        :", anchored.status.value)
+    print("iterations    :", anchored.iterations)
+    print("message       :", anchored.message)
+    print("log likelihood:", f"{anchored.log_likelihood:.6f}")
+    print("object:   fitted theta   (anchor held exactly)")
+    for i in range(N_OBJECTS):
+        tag = "  [anchored]" if i == 0 else ""
+        print(f"  {i}: {anchored.theta[i]:+12.4f}{tag}")
+    assert anchored.theta[0] == TRUE_THETA[0], "anchor moved!"
+
+    # Actual bound boundary: object 1's free ability is capped at 0.20 while
+    # its unconstrained anchored estimate sits higher, so the projected
+    # active-set step lands exactly on the bound and reports the KKT residual.
+    print("\n-- bound boundary: free ability of object 1 capped at 0.20 --")
+    capped = fit_plackett_luce(observations, N_OBJECTS, lam=LAM,
+                               anchors={0: TRUE_THETA[0]},
+                               bounds={1: (-5.0, 0.20)})
+    print("status            :", capped.status.value)
+    print("message           :", capped.message)
+    print("theta[1]          :", f"{capped.theta[1]:.6f}",
+          "(unconstrained anchored estimate:",
+          f"{anchored.theta[1]:.6f})")
+    print("boundary KKT resid:", f"{capped.boundary_kkt_residual:.3e}")
+    assert capped.theta[1] == 0.20, "bound not held exactly"
+    assert anchored.theta[1] > 0.20, "demo bound is not actually binding"
+
     elapsed = time.perf_counter() - started
     print(f"\nelapsed: {elapsed:.2f} s")
     if result.status != ConvergenceStatus.CONVERGED:
         raise SystemExit("demo fit did not converge")
+    if anchored.status != ConvergenceStatus.CONVERGED:
+        raise SystemExit("anchored demo fit did not converge")
+    if capped.status != ConvergenceStatus.CONVERGED:
+        raise SystemExit("bounded demo fit did not converge")
 
 
 if __name__ == "__main__":
