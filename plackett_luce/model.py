@@ -330,6 +330,96 @@ def _objective_only(normalized, theta, lam):
     return obj
 
 
+def _newton_solve(n, lam, initial_theta, fill_all, objective_fn, gtol,
+                  max_iter):
+    """Backtracking Newton on free coordinates x (theta_n-1 = -sum x).
+
+    fill_all(theta, want_derivs) -> (objective, log_likelihood,
+                                     contributions, ambient_g, ambient_H)
+    objective_fn(theta) -> objective
+    Returns (status, steps, theta, message).
+    """
+    x = initial_theta[: n - 1]
+    theta = _theta_from_free(x)
+    status = ConvergenceStatus.MAX_ITERATIONS
+    message = ""
+    steps = 0
+
+    for it in range(max_iter + 1):
+        obj, ll, contribs, g, H = fill_all(theta, True)
+        gr = _reduce_vector(g)
+        gnorm = max((abs(v) for v in gr), default=0.0)
+
+        if not math.isfinite(obj) or not all(map(math.isfinite, gr)):
+            status = ConvergenceStatus.NUMERICAL_ERROR
+            message = "non-finite objective or gradient encountered"
+            steps = it
+            break
+        if gnorm <= gtol:
+            status = ConvergenceStatus.CONVERGED
+            message = (f"reduced gradient infinity norm {gnorm:.3e} <= "
+                       f"gtol {gtol:.3e} after {it} Newton step(s)")
+            steps = it
+            break
+        if it == max_iter:
+            status = ConvergenceStatus.MAX_ITERATIONS
+            message = (f"budget of {max_iter} Newton steps exhausted with "
+                       f"gradient norm {gnorm:.3e} > gtol {gtol:.3e}")
+            steps = max_iter
+            break
+
+        Hr = _reduce_matrix(H)
+        # lambda>0 makes the reduced Hessian analytically positive definite;
+        # a small, documented diagonal jitter is only a rounding fallback.
+        diag_scale = max(Hr[i][i] for i in range(n - 1))
+        L = None
+        for jitter in (0.0, 1e-12, 1e-10, 1e-8, 1e-6):
+            Hrj = [row[:] for row in Hr]
+            if jitter:
+                bump = jitter * diag_scale
+                for i in range(n - 1):
+                    Hrj[i][i] += bump
+            try:
+                L = _cholesky(Hrj)
+                break
+            except PLInputError:
+                continue
+        if L is None:
+            status = ConvergenceStatus.NUMERICAL_ERROR
+            message = "Newton Hessian could not be factored as positive definite"
+            steps = it
+            break
+
+        d = _solve_cholesky(L, [-v for v in gr])
+        directional = math.fsum(gr[i] * d[i] for i in range(n - 1))
+        if directional >= 0.0 or not math.isfinite(directional):
+            status = ConvergenceStatus.NUMERICAL_ERROR
+            message = "Newton direction is not a descent direction"
+            steps = it
+            break
+
+        alpha = 1.0
+        accepted = False
+        for _ in range(_MAX_LINESEARCH_TRIES):
+            xn = [x[i] + alpha * d[i] for i in range(n - 1)]
+            thetan = _theta_from_free(xn)
+            fn = objective_fn(thetan)
+            if math.isfinite(fn) and fn <= obj + _ARMIJO_C1 * alpha * directional:
+                x, theta = xn, thetan
+                accepted = True
+                break
+            alpha *= _STEP_SHRINK
+
+        if not accepted:
+            status = ConvergenceStatus.LINE_SEARCH_FAILED
+            message = (f"backtracking failed after {_MAX_LINESEARCH_TRIES} "
+                       f"halvings at iteration {it + 1}")
+            steps = it
+            break
+
+    return status, steps, theta, message
+
+
 # --------------------------------------------------------------------------- #
 # Public modeling functions
 # --------------------------------------------------------------------------- #
@@ -440,81 +530,12 @@ def fit_plackett_luce(observations, n_objects, *, lam=1.0, initial=None,
 
     x = theta[:n - 1]
     theta = _theta_from_free(x)
-    status = ConvergenceStatus.MAX_ITERATIONS
-    message = ""
-    steps = 0
+    def _fill_all(th, want_derivs):
+        return _fill(norm, th, lam, want_derivs)
 
-    for it in range(max_iter + 1):
-        obj, ll, contribs, g, H = _fill(norm, theta, lam, True)
-        gr = _reduce_vector(g)
-        gnorm = max((abs(v) for v in gr), default=0.0)
-
-        if not math.isfinite(obj) or not all(map(math.isfinite, gr)):
-            status = ConvergenceStatus.NUMERICAL_ERROR
-            message = "non-finite objective or gradient encountered"
-            steps = it
-            break
-        if gnorm <= gtol:
-            status = ConvergenceStatus.CONVERGED
-            message = (f"reduced gradient infinity norm {gnorm:.3e} <= "
-                       f"gtol {gtol:.3e} after {it} Newton step(s)")
-            steps = it
-            break
-        if it == max_iter:
-            status = ConvergenceStatus.MAX_ITERATIONS
-            message = (f"budget of {max_iter} Newton steps exhausted with "
-                       f"gradient norm {gnorm:.3e} > gtol {gtol:.3e}")
-            steps = max_iter
-            break
-
-        Hr = _reduce_matrix(H)
-        # lambda>0 makes the reduced Hessian analytically positive definite;
-        # a small, documented diagonal jitter is only a rounding fallback.
-        diag_scale = max(Hr[i][i] for i in range(n - 1))
-        L = None
-        for tau in (0.0, 1e-12, 1e-10, 1e-8, 1e-6):
-            Hrj = [row[:] for row in Hr]
-            if tau:
-                bump = tau * diag_scale
-                for i in range(n - 1):
-                    Hrj[i][i] += bump
-            try:
-                L = _cholesky(Hrj)
-                break
-            except PLInputError:
-                continue
-        if L is None:
-            status = ConvergenceStatus.NUMERICAL_ERROR
-            message = "Newton Hessian could not be factored as positive definite"
-            steps = it
-            break
-
-        d = _solve_cholesky(L, [-v for v in gr])
-        directional = math.fsum(gr[i] * d[i] for i in range(n - 1))
-        if directional >= 0.0 or not math.isfinite(directional):
-            status = ConvergenceStatus.NUMERICAL_ERROR
-            message = "Newton direction is not a descent direction"
-            steps = it
-            break
-
-        alpha = 1.0
-        accepted = False
-        for _ in range(_MAX_LINESEARCH_TRIES):
-            xn = [x[i] + alpha * d[i] for i in range(n - 1)]
-            thetan = _theta_from_free(xn)
-            fn = _objective_only(norm, thetan, lam)
-            if math.isfinite(fn) and fn <= obj + _ARMIJO_C1 * alpha * directional:
-                x, theta = xn, thetan
-                accepted = True
-                break
-            alpha *= _STEP_SHRINK
-
-        if not accepted:
-            status = ConvergenceStatus.LINE_SEARCH_FAILED
-            message = (f"backtracking failed after {_MAX_LINESEARCH_TRIES} "
-                       f"halvings at iteration {it + 1}")
-            steps = it
-            break
+    status, steps, theta, message = _newton_solve(
+        n, lam, theta, _fill_all, lambda th: _objective_only(norm, th, lam),
+        gtol, max_iter)
 
     final_obj, final_ll, final_contribs, fg, _ = _fill(norm, theta, lam, True)
     final_gnorm = max((abs(v) for v in _reduce_vector(fg)), default=0.0)

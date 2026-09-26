@@ -5,20 +5,38 @@ from partial top-k, tie-free rankings** with optional per-observation
 participant sets, a sum-to-zero constraint, and an L2 penalty. Standard library
 only.
 
+**Version 2** of this library additionally supports **partial rankings whose
+rank positions are either one object or one two-way tie**, modeled as a single
+joint choice (see “Two-way-tied model” below). The original tie-free
+Plackett–Luce entry point is unchanged; the tied extension is a deliberately
+scoped model, **not** a claimed unified standard for all real tied rankings.
+
 ## Requirements
 
 - **Python 3.14.7** (developed/tested on CPython 3.14.7, Linux). No third-party
   packages; no network, accounts, keys, database, middleware, or Docker.
 - Tests use only `unittest`; the demo uses only the library plus `math`/`time`.
 
+## Environment setup (venv)
+
+The code uses the standard library only; the venv just pins the interpreter.
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+python --version          # must show Python 3.14.7
+```
+
 ## Commands
 
 ```bash
-python -m unittest discover -s tests -v   # full test suite (35 tests)
-python demo.py                            # deterministic live demo (~0.1 s)
+python -m unittest discover -s tests -v   # full suite: original + tied tests (63 tests)
+python demo.py                            # tie-free live demo (~0.1 s)
+python demo_iteration.py                  # two-way-tied live demo (< 1 s, budget 90 s)
 ```
 
 Both run fully offline from the repository root.
+Both demos compute everything live: no `sleep`, no pre-recorded output.
 
 ## Model
 
@@ -162,6 +180,72 @@ The solver's default stationarity tolerance is `gtol = 1e-10` on the reduced
 gradient infinity norm; output abilities are typically accurate to ~10 digits
 near the optimum on the tested cases.
 
+## Two-way-tied model (`plackett_luce.ties`)
+
+At one stage with remaining object set `R`, every singleton and every
+unordered pair is offered in **one common, jointly normalized choice**:
+
+```
+w({i})     = exp(theta_i)
+w({i, j})  = tau * exp((theta_i + theta_j) / 2),   i < j
+P(outcome) = w(outcome) / ( Σ_{i ∈ R} exp(theta_i)
+                            + Σ_{i < j, i,j ∈ R} tau·exp((theta_i + theta_j)/2) )
+```
+
+- `tau > 0` is a **fixed, user-given** positive number; it is never estimated.
+- A tie `{i, j}` is **one joint outcome**, never the average (or sum) of the
+  two ordered finishes `i` before `j` and `j` before `i`; the pair appears
+  exactly once in the denominator.
+- After a stage, **all chosen objects are removed**: one object for a
+  singleton, both for a pair. Unchosen participants remain in every later
+  denominator, exactly as for tie-free partial rankings.
+- A partial ranking is an ordered sequence of groups, each of size one or
+  two; e.g. `((0, 1), (2,))` means “0 and 1 tie for first, then 2 is next”.
+  Writing a pair as `(1, 0)` denotes the same canonical unordered outcome
+  `(0, 1)` and gives the same probability.
+- Abilities are fitted under the same `Σ theta_i = 0` gauge and L2 penalty;
+  the result includes the log likelihood, per-observation log contributions,
+  and the **analytic free-coordinate gradient** at the optimum.
+- Stable logsumexp is used per stage, so the pair term at
+  `tau = 1e-300` underflows exactly to zero and a singleton-only path then
+  agrees bit-for-bit with the original tie-free entry. The model is
+  differentiable in `theta`; the score variable is `u = 1` on a singleton
+  member and `u = 1/2` on each pair member, giving
+  `g = E_p[u] − u_chosen`, `H = Var_p(u)` per stage.
+
+### Tied-model interface
+
+| Name | Purpose |
+|---|---|
+| `TiedObservation(choices=(), participants=None)` | Ordered singleton/pair groups, best first; same participant semantics as `Observation`. |
+| `TiedPLResult` | `status, converged, iterations, theta, tau, log_likelihood, penalized_objective, log_contributions, gradient_free, gradient_norm, message`. |
+| `fit_tied_plackett_luce(observations, n_objects, tau, *, lam=1.0, initial=None, max_iter=100, gtol=1e-10)` | Penalized sum-to-zero Newton fit with `tau` held fixed. |
+| `tied_ranking_log_probability(choices, theta, tau, participants=None)` | Stable staged log probability. |
+| `tied_ranking_probability(...)` | `exp` of the above (may underflow). |
+| `tied_choice_probabilities(remaining, theta, tau)` | Enumerates all `|R|` singleton and `C(|R|,2)` pair probabilities of one joint choice (use on small sets); the tuple sums to 1. |
+| `tied_penalized_objective(...)` / `tied_penalized_gradient_free(...)` / `tied_penalized_hessian_free(...)` | Objective and analytic derivatives in the `n−1` free coordinates. |
+
+The same validation/error semantics apply (`PLInputError`, bool rejected,
+finite numbers, indices in range, sum-to-zero enforced on user theta).
+Additionally the following are rejected **before any computation**:
+
+- a group of size 0 or size ≥ 3 (**three-way ties are not supported**);
+- a pair repeating the same object, e.g. `(1, 1)`;
+- the same object appearing in two different groups (each object is removed
+  after its first selection);
+- a chosen object absent from that observation's participant set;
+- non-finite or non-positive `tau`.
+
+### Tied-model accuracy checks
+
+| Quantity checked | Reference method | Tolerance |
+|---|---|---|
+| Enumerated singleton/pair choice probabilities | Closed-form weights, common denominator; `fsum` normalization | `1e-14` absolute, sum exactly 1 |
+| Staged tied log probability | Independent implementation in `tests/reference_ties.py` | `1e-12` absolute |
+| Analytic free gradient | Independent central finite differences, `h = 1e-6` | `1e-6 × max(1,‖ref‖∞)` |
+| `tau → 0` singleton path | Direct bit-for-bit equality with original `ranking_log_probability` (`tau = 1e-300`) | exact |
+| Sum-to-zero, gradient at optimum, `Σ contributions = log-likelihood` | Direct | `1e-10` … `1e-12` |
+
 ## Design trade-offs
 
 - **Pure Python, no NumPy.** Matrix size is at most `19×19` (n ≤ 20), so
@@ -178,11 +262,20 @@ near the optimum on the tested cases.
 ## Known limitations
 
 - Implements exactly the contracted subset: tie-free top-k Plackett–Luce,
-  one global L2 penalty, sum-to-zero gauge. No ties/partial orders with
-  equivalence classes, no object-specific or grouped penalties, no
-  hierarchical/covariate (Bradley–Terry–Luce with features) models, no
-  Bayesian posterior or standard-error output, no claim of standards
-  compliance beyond this contract.
+  one global L2 penalty, sum-to-zero gauge; plus the scoped two-way-tied
+  extension in `plackett_luce.ties` (singletons and joint pairs in one common
+  denominator, fixed `tau`). The tied extension is **not** presented as a
+  unified standard for all real tied rankings: it does not support three-way
+  or larger ties, variable tie widths, ties as partial orders / interval
+  censoring, or inference over `tau`. Neither model offers object-specific or
+  grouped penalties, hierarchical/covariate (Bradley–Terry–Luce with features)
+  models, or Bayesian posterior/standard-error output, and no standards
+  compliance beyond this contract is claimed.
+- The original tie-free entry (`fit_plackett_luce`, `Observation`,
+  `ranking_log_probability`) is preserved unchanged; it never interprets its
+  inputs through the tied model.
+- `tied_choice_probabilities` enumerates `|R| + C(|R|,2)` outcomes and is
+  intended for small choice sets and normalization checks (n ≤ 20).
 - `ranking_probability` exponentiates a log probability and can underflow to
   `0.0`; use `ranking_log_probability` for very small probabilities.
 - Inputs must be materializable in memory; the observation iterable is
@@ -195,8 +288,13 @@ near the optimum on the tested cases.
 ```
 plackett_luce/__init__.py     # public API re-exports
 plackett_luce/model.py        # validation, likelihood, Newton solver
+plackett_luce/ties.py         # at-most-two-way-tied extension
 tests/reference.py            # INDEPENDENT reference (no core import)
+tests/reference_ties.py       # independent tied-model reference (no core import)
 tests/test_validation.py      # contract / error-semantics tests
 tests/test_math.py            # analytic extremum, FD derivatives, fit quality
+tests/test_ties_validation.py # tied-model contract / rejection tests
+tests/test_ties_math.py       # tied normalization, FD gradient, tau->0, fit
 demo.py                       # deterministic synthetic-data demonstration
+demo_iteration.py             # deterministic tied-model iteration demonstration
 ```
